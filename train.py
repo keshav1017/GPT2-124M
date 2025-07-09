@@ -1,9 +1,17 @@
-from dataclasses import dataclass
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import math
 import inspect
+import math
+import os
+import sys
+import time
+from dataclasses import dataclass
+
+import tiktoken
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ----------------------------------------------------------------------
 
@@ -236,14 +244,14 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------------------------------------
 
-import tiktoken
-
 class DataLoaderLite:
 
-    def __init__(self, B, T, file_path='input.txt'):
+    def __init__(self, B, T, process_rank, num_processes, file_path='tiny_shakesphere.txt'):
         self.B = B # batch_size
         self.T = T # block_size (sequence length)
         self.file_path = file_path
+        self.process_rank = process_rank
+        self.num_process = num_processes
 
         # at init load tokens from disk and store them in memory
         with open(self.file_path, 'r', encoding='utf-8') as f:
@@ -256,7 +264,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -265,16 +273,53 @@ class DataLoaderLite:
         y = buf[1:].view(B, T) # targets
 
         # advance the position in the tensor
-        self.current_position += B*T
+        self.current_position += B * T * self.process_rank
 
         # if loading the next batch runs out of bounds
-        if self.current_position + (B*T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.process_rank + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
 
         return x, y
 
 # -----------------------------------------------------------------------------------------------------------
-import time
+
+"""
+Simple launch:
+>> python train.py
+DDP launch for e.g. 8 GPUs
+>> torchrun --standalone -nproc_per_node=8 train.py
+"""
+
+# run training loop
+
+
+# set up DDP (distributed data parallel)
+# torchrum command sets env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this  a ddp run ?
+
+if ddp:
+    # use of DDP demands CUDA
+    assert torch.cuda.is_available(), "CUDA is required for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 # attempt to auto detect the decvice
 device = "cpu"
@@ -286,20 +331,25 @@ torch.manual_seed(1337)
 total_batch_size = 32 # 2**19, ~0.5M, in number of tokens
 B = 4 # micro batch size
 T = 8 # sequence length
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B*T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 torch.set_float32_matmul_precision('high')
 
-# get logits
+# create model
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # model = torch.compile(model)
-# logits, loss = model(x, y)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -342,7 +392,12 @@ for step in range(iter_num):
         # instead of SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_steps == grad_accum_steps - 1)
         loss.backward()
+    
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -354,13 +409,16 @@ for step in range(iter_num):
     optimizer.step()
     t1 = time.time()
     dt = t1-t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    print(
-        f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tok/sec: {tokens_per_sec:.2f}"
-    )
 
-import sys; sys.exit(0)
+    if master_process:
+        print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tok/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
+
+sys.exit(0)
 
 # prefix tokens
 model.eval()
@@ -374,6 +432,7 @@ model.to(device)
 
 # prefix tokens
 import tiktoken
+
 enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
