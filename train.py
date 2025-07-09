@@ -5,6 +5,7 @@ import sys
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import tiktoken
 import torch
 import torch.distributed as dist
@@ -244,27 +245,38 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------------------------------------
 
+def load_tokens(filename):
+    npt = np.load(filename)
+    ppt = torch.tensor(npt, dtype=torch.long)
+    return ppt
+
 class DataLoaderLite:
 
-    def __init__(self, B, T, process_rank, num_processes, file_path='tiny_shakesphere.txt'):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B # batch_size
         self.T = T # block_size (sequence length)
-        self.file_path = file_path
         self.process_rank = process_rank
         self.num_process = num_processes
+        assert split in {'train', 'val'}
 
-        # at init load tokens from disk and store them in memory
-        with open(self.file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
 
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
-        # state
-        self.current_position = self.B * self.T * self.process_rank
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank 
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -272,12 +284,13 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T) # inputs
         y = buf[1:].view(B, T) # targets
 
-        # advance the position in the tensor
-        self.current_position += B * T * self.process_rank
+        self.current_position += B * T * self.num_processes
 
-        # if loading the next batch runs out of bounds
-        if self.current_position + (B * T * self.process_rank + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
 
         return x, y
 
@@ -294,7 +307,7 @@ DDP launch for e.g. 8 GPUs
 
 
 # set up DDP (distributed data parallel)
-# torchrum command sets env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# torchrun command sets env variables RANK, LOCAL_RANK, and WORLD_SIZE
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this  a ddp run ?
 
 if ddp:
@@ -337,7 +350,8 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high')
 
@@ -353,8 +367,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 
 def get_lr(it):
 
@@ -374,10 +388,53 @@ def get_lr(it):
 
 # optimize!
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
-iter_num = 50
 
-for step in range(iter_num):
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:  # open for writing to clear the file
+    pass
+
+for step in range(max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
+
+    # once in a while evaluate our validation loss
+    if step % 250 == 0 or last_step:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "config": raw_model.config,
+                    "step": step,
+                    "val_loss": val_loss_accum.item(),
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
+
+    # do one step of the optimization
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_steps in range(grad_accum_steps):
@@ -395,7 +452,7 @@ for step in range(iter_num):
         if ddp:
             model.require_backward_grad_sync = (micro_steps == grad_accum_steps - 1)
         loss.backward()
-    
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
