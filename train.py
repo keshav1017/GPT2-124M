@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 # ----------------------------------------------------------------------
 
@@ -42,7 +43,15 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flask attention
+
+        # attention (materializes the large (T, T) matrix for all the queries)
+        # att = (q @ k.transpose(-2, 1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assembke all head outputs side by side
 
         # output projection
@@ -244,14 +253,14 @@ train_loader = DataLoaderLite(B=4, T=8)
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # model = torch.compile(model)
 # logits, loss = model(x, y)
 
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-iter_num = 20
+iter_num = 50
 
 for i in range(iter_num):
     t0 = time.time()
